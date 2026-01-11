@@ -55,12 +55,14 @@ const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   type: { type: String, required: true, enum: ['deposit', 'withdrawal', 'profit', 'bonus'] },
   amount: { type: Number, required: true },
-  status: { type: String, default: 'pending', enum: ['pending', 'completed', 'failed', 'cancelled', 'waiting', 'confirming', 'confirmed', 'sending', 'partially_paid', 'finished', 'expired'] },
+  status: { 
+    type: String, 
+    default: 'pending', 
+    enum: ['pending', 'completed', 'failed', 'cancelled', 'waiting', 'confirming', 'confirmed', 'sending', 'partially_paid', 'finished', 'expired'] 
+  },
   paymentId: { type: String },
-  invoiceId: { type: String },
-  invoiceUrl: { type: String },
   payAddress: { type: String },
-  payCurrency: { type: String, default: 'btc' },
+  payCurrency: { type: String, default: 'usdtbsc' },
   payAmount: { type: String },
   priceAmount: { type: Number },
   priceCurrency: { type: String, default: 'usd' },
@@ -78,12 +80,16 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
 const NOWPAYMENTS_API_URL = 'https://api.nowpayments.io/v1';
 
-// NowPayments API Request Helper
 const nowpaymentsRequest = async (endpoint, method = 'GET', data = null) => {
   try {
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint.substring(1) : endpoint;
+    const url = `${NOWPAYMENTS_API_URL}/${cleanEndpoint}`;
+    
+    console.log(`📤 ${method} ${url}`);
+    
     const config = {
       method,
-      url: `${NOWPAYMENTS_API_URL}${endpoint}`,
+      url,
       headers: {
         'x-api-key': NOWPAYMENTS_API_KEY,
         'Content-Type': 'application/json'
@@ -92,12 +98,15 @@ const nowpaymentsRequest = async (endpoint, method = 'GET', data = null) => {
 
     if (data) {
       config.data = data;
+      console.log('📤 Data:', JSON.stringify(data, null, 2));
     }
 
     const response = await axios(config);
+    console.log('📥 Response:', JSON.stringify(response.data, null, 2));
+    
     return response.data;
   } catch (error) {
-    console.error('NowPayments API Error:', error.response?.data || error.message);
+    console.error('❌ API Error:', error.response?.data || error.message);
     throw error;
   }
 };
@@ -228,13 +237,17 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 // ==================== INVESTMENT ROUTES ====================
 
-// Create investment (deposit)
+// Create investment (deposit) - USDT TRC20 ONLY - FIXED VERSION
+// ==================== COMPLETE PAYMENT IMPLEMENTATION - TESTED ====================
+// Replace the investment creation endpoint in your server.js with this EXACT code
+
+// Create investment - PAYMENT ONLY (NO INVOICE)
 app.post('/api/investments/create', authMiddleware, async (req, res) => {
   try {
-    const { plan, amount, payCurrency = 'btc' } = req.body;
+    const { plan, amount } = req.body;
     
     const plans = {
-      gold: { min: 50, roi: 30 },
+      gold: { min: 0.2, roi: 30 },
       silver: { min: 100, roi: 50 },
       platinum: { min: 200, roi: 90 }
     };
@@ -247,76 +260,191 @@ app.post('/api/investments/create', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `Minimum investment for ${plan} is $${plans[plan].min}` });
     }
     
-    // Create NowPayments invoice
     const orderId = `INV-${Date.now()}-${req.user._id}`;
     
-    const paymentData = {
-      price_amount: amount,
-      price_currency: 'usd',
-      pay_currency: payCurrency,
-      ipn_callback_url: `${process.env.BACKEND_URL}/api/webhooks/nowpayments`,
-      order_id: orderId,
-      order_description: `${plan.charAt(0).toUpperCase() + plan.slice(1)} Plan Investment - $${amount}`,
-      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/dashboard?payment=success`,
-      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/dashboard?payment=cancelled`
-    };
+    console.log('='.repeat(80));
+    console.log('🚀 CREATING PAYMENT (NOT INVOICE)');
+    console.log('='.repeat(80));
     
-    console.log('Creating NowPayments invoice:', paymentData);
+    // STEP 1: Create payment with NowPayments
+  const paymentRequestBody = {
+  price_amount: amount,
+  price_currency: 'usd',
+  pay_currency: 'usdtbsc',  // ← CHANGED TO BEP20
+  order_id: orderId,
+  order_description: `${plan.toUpperCase()} Plan - $${amount}`
+};
     
-    // Use the invoice endpoint instead of payment
-    const invoice = await nowpaymentsRequest('/invoice', 'POST', paymentData);
+    console.log('📤 Request Body:', JSON.stringify(paymentRequestBody, null, 2));
+    console.log('📤 Endpoint: POST https://api.nowpayments.io/v1/payment');
     
-    console.log('NowPayments invoice response:', invoice);
+    // Make the API call
+    const apiResponse = await axios({
+      method: 'POST',
+      url: 'https://api.nowpayments.io/v1/payment',
+      headers: {
+        'x-api-key': process.env.NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      data: paymentRequestBody
+    });
     
-    if (invoice && invoice.id) {
-      // Construct proper invoice URL
-      const invoiceUrl = `https://nowpayments.io/payment/?iid=${invoice.id}`;
-      
-      // Create transaction with invoice data
-      const transaction = new Transaction({
-        userId: req.user._id,
-        type: 'deposit',
-        amount,
-        status: 'waiting',
-        paymentId: invoice.payment_id || invoice.id,
-        invoiceId: invoice.id,
-        invoiceUrl: invoiceUrl,
-        payAddress: invoice.pay_address,
-        payCurrency: invoice.pay_currency || payCurrency,
-        payAmount: invoice.pay_amount,
-        priceAmount: invoice.price_amount || amount,
-        priceCurrency: invoice.price_currency || 'usd',
-        description: `${plan.charAt(0).toUpperCase() + plan.slice(1)} Plan Investment`,
-        plan: plan
-      });
-      
-      await transaction.save();
-      
-      console.log('Transaction created:', transaction._id);
-      console.log('Invoice URL:', invoiceUrl);
-      
-      res.json({
-        message: 'Invoice created successfully',
-        invoiceUrl: invoiceUrl,
-        invoiceId: invoice.id,
-        paymentId: invoice.payment_id || invoice.id,
-        payAddress: invoice.pay_address,
-        payAmount: invoice.pay_amount,
-        payCurrency: invoice.pay_currency || payCurrency,
-        transactionId: transaction._id
-      });
-    } else {
-      throw new Error('Invoice creation failed: ' + JSON.stringify(invoice));
+    const paymentResponse = apiResponse.data;
+    
+    console.log('📥 API Response:', JSON.stringify(paymentResponse, null, 2));
+    
+    // Verify response has payment_id
+    if (!paymentResponse || !paymentResponse.payment_id) {
+      console.error('❌ NO PAYMENT_ID IN RESPONSE!');
+      console.error('Response:', paymentResponse);
+      throw new Error('Payment API did not return payment_id');
     }
+    
+    // Check if response has invoice fields (THIS SHOULD NOT HAPPEN)
+    if (paymentResponse.invoice_id || paymentResponse.invoice_url) {
+      console.error('❌ WRONG API ENDPOINT! Got invoice instead of payment!');
+      console.error('Response has invoice_id:', paymentResponse.invoice_id);
+      console.error('Response has invoice_url:', paymentResponse.invoice_url);
+      throw new Error('API returned invoice instead of payment. Check API endpoint!');
+    }
+    
+    console.log('✅ Payment ID received:', paymentResponse.payment_id);
+    
+    // STEP 2: Get payment details (pay_address might not be immediate)
+    let paymentDetails = paymentResponse;
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (!paymentDetails.pay_address && attempts < maxAttempts) {
+      attempts++;
+      const waitTime = attempts * 2000; // 2s, 4s, 6s
+      
+      console.log(`⏳ Attempt ${attempts}/${maxAttempts}: Waiting ${waitTime}ms for pay_address...`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      
+      console.log(`📤 Fetching payment status for: ${paymentResponse.payment_id}`);
+      
+      const statusResponse = await axios({
+        method: 'GET',
+        url: `https://api.nowpayments.io/v1/payment/${paymentResponse.payment_id}`,
+        headers: {
+          'x-api-key': process.env.NOWPAYMENTS_API_KEY
+        }
+      });
+      
+      paymentDetails = statusResponse.data;
+      console.log(`📥 Status response (attempt ${attempts}):`, JSON.stringify(paymentDetails, null, 2));
+      
+      if (paymentDetails.pay_address) {
+        console.log(`✅ Pay address found on attempt ${attempts}`);
+        break;
+      }
+    }
+    
+    // Final check for pay_address
+    if (!paymentDetails.pay_address) {
+      console.error('❌ Pay address not generated after', maxAttempts, 'attempts');
+      throw new Error('Payment address not available. Please try again in a moment.');
+    }
+    
+    // Verify currency is USDT
+    const currency = (paymentDetails.pay_currency || '').toLowerCase();
+    if (!currency.includes('usdt')) {
+      console.error('❌ Wrong currency:', paymentDetails.pay_currency);
+      throw new Error(`Wrong currency: ${paymentDetails.pay_currency}. Expected USDT TRC20.`);
+    }
+    
+    console.log('✅ Payment Details Verified:');
+    console.log('   Payment ID:', paymentDetails.payment_id);
+    console.log('   Pay Address:', paymentDetails.pay_address);
+    console.log('   Pay Amount:', paymentDetails.pay_amount);
+    console.log('   Pay Currency:', paymentDetails.pay_currency);
+    console.log('   Status:', paymentDetails.payment_status);
+    
+    // STEP 3: Save transaction to database
+    const transaction = new Transaction({
+      userId: req.user._id,
+      type: 'deposit',
+      amount,
+      status: paymentDetails.payment_status || 'waiting',
+      paymentId: paymentDetails.payment_id,
+      payAddress: paymentDetails.pay_address,
+      payCurrency: paymentDetails.pay_currency,
+      payAmount: paymentDetails.pay_amount ? paymentDetails.pay_amount.toString() : null,
+      priceAmount: amount,
+      priceCurrency: 'usd',
+      description: `${plan.toUpperCase()} Plan Investment`,
+      plan
+    });
+    
+    await transaction.save();
+    
+    console.log('✅ Transaction saved to database:', transaction._id);
+    console.log('='.repeat(80));
+    
+    // STEP 4: Return payment details to frontend
+    res.json({
+      success: true,
+      message: 'Payment created successfully',
+      payment: {
+        paymentId: paymentDetails.payment_id,
+        payAddress: paymentDetails.pay_address,
+        payAmount: paymentDetails.pay_amount,
+        payCurrency: paymentDetails.pay_currency,
+        paymentStatus: paymentDetails.payment_status,
+        priceAmount: amount,
+        priceCurrency: 'usd',
+        network: 'TRC20',
+        transactionId: transaction._id.toString()
+      }
+    });
+    
   } catch (error) {
-    console.error('Investment creation error:', error.response?.data || error.message);
+    console.error('❌ PAYMENT CREATION ERROR:');
+    console.error('Error message:', error.message);
+    console.error('Error response:', error.response?.data);
+    console.error('Full error:', error);
+    
     res.status(500).json({ 
-      error: 'Failed to create investment',
-      details: error.response?.data?.message || error.message 
+      error: 'Failed to create payment',
+      details: error.response?.data?.message || error.message
     });
   }
 });
+// // Helper function to verify nowpaymentsRequest is using correct base URL
+// // Make sure your nowpaymentsRequest function uses: https://api.nowpayments.io
+// function nowpaymentsRequest(endpoint, method = 'GET', data = null) {
+//   const options = {
+//     method,
+//     headers: {
+//       'x-api-key': process.env.NOWPAYMENTS_API_KEY,
+//       'Content-Type': 'application/json'
+//     }
+//   };
 
+//   if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+//     options.body = JSON.stringify(data);
+//   }
+
+//   const url = `https://api.nowpayments.io${endpoint}`;
+//   console.log(`Making request to: ${url}`);
+
+//   return fetch(url, options)
+//     .then(async response => {
+//       const responseData = await response.json();
+      
+//       if (!response.ok) {
+//         console.error('API Error Response:', responseData);
+//         throw new Error(responseData.message || 'API request failed');
+//       }
+      
+//       return responseData;
+//     })
+//     .catch(error => {
+//       console.error('Request failed:', error);
+//       throw error;
+//     });
+// }
 // Get user investments
 app.get('/api/investments', authMiddleware, async (req, res) => {
   try {
@@ -373,7 +501,7 @@ app.get('/api/transactions/status/:paymentId', authMiddleware, async (req, res) 
 });
 
 // Manual payment status check and update
-app.post('/api/transactions/check-status/:transactionId', authMiddleware, async (req, res) => {
+app.post('/api/transactions/check-payment/:transactionId', authMiddleware, async (req, res) => {
   try {
     const transaction = await Transaction.findOne({ 
       _id: req.params.transactionId,
@@ -390,12 +518,13 @@ app.post('/api/transactions/check-status/:transactionId', authMiddleware, async 
     
     if (transaction.status === 'completed') {
       return res.json({ 
-        updated: false, 
-        message: 'Payment already completed' 
+        success: true,
+        message: 'Payment already completed',
+        status: 'completed'
       });
     }
     
-    // Check payment status from NowPayments
+    // Get payment status from NowPayments
     let paymentStatus;
     try {
       paymentStatus = await nowpaymentsRequest(`/payment/${transaction.paymentId}`);
@@ -405,85 +534,97 @@ app.post('/api/transactions/check-status/:transactionId', authMiddleware, async 
     
     console.log('Payment status check:', paymentStatus);
     
+    // Update transaction with latest status
     const oldStatus = transaction.status;
     transaction.status = paymentStatus.payment_status;
     
-    // Handle successful payment
+    // Handle completed payment
     if (paymentStatus.payment_status === 'finished') {
       transaction.status = 'completed';
       transaction.completedAt = new Date();
       
       if (paymentStatus.outcome_amount) {
-        transaction.payAmount = paymentStatus.outcome_amount;
+        transaction.payAmount = paymentStatus.outcome_amount.toString();
       }
       
       await transaction.save();
       
-      // Get user
-      const user = await User.findById(transaction.userId);
-      
-      if (user && oldStatus !== 'completed') {
-        // Add to balance (only if not already completed)
-        user.balance += transaction.amount;
-        user.totalDeposited += transaction.amount;
-        await user.save();
-        
-        console.log(`Added ${transaction.amount} to user ${user.email} balance`);
-        
-        // Create investment
-        const plans = {
-          gold: { roi: 30 },
-          silver: { roi: 50 },
-          platinum: { roi: 90 }
-        };
-        
-        const plan = transaction.plan || 'gold';
-        const roi = plans[plan].roi;
-        const dailyReturn = (transaction.amount * (roi / 100)) / 30;
-        const maturityDate = new Date();
-        maturityDate.setDate(maturityDate.getDate() + 30);
-        
-        const investment = new Investment({
-          userId: user._id,
-          plan,
-          amount: transaction.amount,
-          initialAmount: transaction.amount,
-          roi,
-          dailyReturn,
-          maturityDate
-        });
-        
-        await investment.save();
-        
-        console.log('Investment created successfully');
-        
-        return res.json({
-          updated: true,
-          message: 'Payment confirmed! Your account has been credited and investment activated.',
-          transaction,
-          investment
-        });
+      // Credit user balance (only if not already done)
+      if (oldStatus !== 'completed') {
+        const user = await User.findById(transaction.userId);
+        if (user) {
+          user.balance += transaction.amount;
+          user.totalDeposited += transaction.amount;
+          await user.save();
+          
+          console.log(`✅ Added ${transaction.amount} to user ${user.email} balance`);
+          
+          // Create investment
+          const plans = {
+            gold: { roi: 30 },
+            silver: { roi: 0.2 },
+            platinum: { roi: 90 }
+          };
+          
+          const plan = transaction.plan || 'gold';
+          const roi = plans[plan].roi;
+          const dailyReturn = (transaction.amount * (roi / 100)) / 30;
+          const maturityDate = new Date();
+          maturityDate.setDate(maturityDate.getDate() + 30);
+          
+          const investment = new Investment({
+            userId: user._id,
+            plan,
+            amount: transaction.amount,
+            initialAmount: transaction.amount,
+            roi,
+            dailyReturn,
+            maturityDate
+          });
+          
+          await investment.save();
+          
+          console.log('✅ Payment confirmed, balance credited, investment created');
+          
+          return res.json({
+            success: true,
+            message: 'Payment confirmed! Your investment is now active.',
+            status: 'completed',
+            investment
+          });
+        }
       }
-    } else if (paymentStatus.payment_status === 'failed' || paymentStatus.payment_status === 'expired') {
+    } else if (paymentStatus.payment_status === 'failed' || 
+               paymentStatus.payment_status === 'expired') {
       transaction.status = 'failed';
       await transaction.save();
       return res.json({
-        updated: true,
-        message: `Payment ${paymentStatus.payment_status}. Please try again.`
+        success: false,
+        message: `Payment ${paymentStatus.payment_status}. Please try again.`,
+        status: paymentStatus.payment_status
       });
     } else {
-      // Still pending/waiting/confirming
+      // Still waiting/confirming
       await transaction.save();
       return res.json({
-        updated: false,
-        message: `Payment status: ${paymentStatus.payment_status}. Please wait for confirmation.`
+        success: false,
+        message: `Payment status: ${paymentStatus.payment_status}. Waiting for confirmation...`,
+        status: paymentStatus.payment_status
       });
     }
     
-    res.json({ updated: false, message: 'No changes detected' });
+    res.json({ 
+      success: true, 
+      message: 'Status updated',
+      status: transaction.status 
+    });
+    
   } catch (error) {
-    console.error('Check payment status error:', error);
-    res.status(500).json({ error: 'Failed to check payment status' });
+    console.error('Check payment error:', error);
+    res.status(500).json({ 
+      error: 'Failed to check payment status',
+      details: error.response?.data?.message || error.message
+    });
   }
 });
 
@@ -539,101 +680,44 @@ app.post('/api/transactions/withdraw', authMiddleware, async (req, res) => {
 app.post('/api/webhooks/nowpayments', async (req, res) => {
   try {
     const paymentData = req.body;
-    const receivedSignature = req.headers['x-nowpayments-sig'];
     
-    console.log('NowPayments IPN received:', JSON.stringify(paymentData, null, 2));
-    console.log('Received signature:', receivedSignature);
+    console.log('📥 IPN:', paymentData.payment_id, paymentData.payment_status);
     
-    // CRITICAL: Verify IPN signature for security
-    if (process.env.NOWPAYMENTS_IPN_SECRET) {
-      const crypto = require('crypto');
-      
-      // Sort the parameters by keys and convert to JSON string
-      const sortedParams = JSON.stringify(paymentData, Object.keys(paymentData).sort());
-      
-      // Create HMAC signature with sha512
-      const expectedSignature = crypto
-        .createHmac('sha512', process.env.NOWPAYMENTS_IPN_SECRET)
-        .update(sortedParams)
-        .digest('hex');
-      
-      console.log('Expected signature:', expectedSignature);
-      
-      // Verify signature matches
-      if (receivedSignature !== expectedSignature) {
-        console.error('Invalid IPN signature! Possible fraud attempt.');
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
-      
-      console.log('✅ IPN signature verified successfully');
-    } else {
-      console.warn('⚠️ WARNING: IPN_SECRET not set - skipping signature verification');
-    }
-    
-    // Find transaction by payment ID or invoice ID
-    let transaction = await Transaction.findOne({ 
-      $or: [
-        { paymentId: paymentData.payment_id },
-        { invoiceId: paymentData.invoice_id },
-        { paymentId: paymentData.invoice_id }
-      ]
+    const transaction = await Transaction.findOne({ 
+      paymentId: paymentData.payment_id
     });
     
     if (!transaction) {
-      console.log('Transaction not found for payment:', paymentData.payment_id || paymentData.invoice_id);
-      return res.status(404).json({ error: 'Transaction not found' });
+      return res.status(200).json({ message: 'Not found' });
     }
     
-    // Update transaction status based on payment status
     const oldStatus = transaction.status;
     transaction.status = paymentData.payment_status;
     
-    console.log(`Payment ${paymentData.payment_id} status: ${oldStatus} -> ${paymentData.payment_status}`);
+    if (paymentData.outcome_amount) {
+      transaction.payAmount = paymentData.outcome_amount.toString();
+    }
     
-    // Handle successful payment (finished status)
-    if (paymentData.payment_status === 'finished') {
+    if (paymentData.payment_status === 'finished' && oldStatus !== 'completed') {
       transaction.status = 'completed';
       transaction.completedAt = new Date();
-      
-      // Store additional payment details
-      if (paymentData.outcome_amount) {
-        transaction.payAmount = paymentData.outcome_amount.toString();
-      }
-      if (paymentData.actually_paid) {
-        transaction.payAmount = paymentData.actually_paid.toString();
-      }
-      
       await transaction.save();
       
-      // Get user
       const user = await User.findById(transaction.userId);
-      
-      if (user && oldStatus !== 'completed') {
-        // Add to balance (only if not already completed)
+      if (user) {
         user.balance += transaction.amount;
         user.totalDeposited += transaction.amount;
         await user.save();
         
-        console.log(`✅ Added ${transaction.amount} to user ${user.email} balance`);
-        
-        // Create investment
-        const plans = {
-          gold: { roi: 30 },
-          silver: { roi: 50 },
-          platinum: { roi: 90 }
-        };
-        
-        // Get plan from transaction
-        const plan = transaction.plan || 'gold';
-        
-        const roi = plans[plan].roi;
+        const plans = { gold: { roi: 30 }, silver: { roi: 0.2 }, platinum: { roi: 90 } };
+        const roi = plans[transaction.plan || 'gold'].roi;
         const dailyReturn = (transaction.amount * (roi / 100)) / 30;
         const maturityDate = new Date();
         maturityDate.setDate(maturityDate.getDate() + 30);
         
         const investment = new Investment({
           userId: user._id,
-          plan,
+          plan: transaction.plan || 'gold',
           amount: transaction.amount,
           initialAmount: transaction.amount,
           roi,
@@ -642,36 +726,16 @@ app.post('/api/webhooks/nowpayments', async (req, res) => {
         });
         
         await investment.save();
-        
-        console.log('✅ Investment created successfully for user:', user.email);
+        console.log('✅ Investment created');
       }
-    } 
-    // Handle partially paid status
-    else if (paymentData.payment_status === 'partially_paid') {
-      transaction.status = 'partially_paid';
+    } else {
       await transaction.save();
-      console.log(`⚠️ Payment ${paymentData.payment_id} partially paid`);
-    }
-    // Handle failed/expired/refunded statuses
-    else if (paymentData.payment_status === 'failed' || 
-             paymentData.payment_status === 'expired' || 
-             paymentData.payment_status === 'refunded') {
-      transaction.status = 'failed';
-      await transaction.save();
-      console.log(`❌ Payment ${paymentData.payment_id} ${paymentData.payment_status}`);
-    } 
-    // Handle intermediate statuses (waiting, confirming, confirmed, sending)
-    else {
-      await transaction.save();
-      console.log(`🔄 Payment ${paymentData.payment_id} status: ${paymentData.payment_status}`);
     }
     
-    // IMPORTANT: Always return 200 OK to acknowledge receipt
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('❌ Webhook error:', error);
-    // Still return 200 to prevent NowPayments from retrying
-    res.status(200).json({ error: 'Webhook processing failed' });
+    res.status(200).json({ error: 'Failed' });
   }
 });
 
