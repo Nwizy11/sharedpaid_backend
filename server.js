@@ -28,10 +28,25 @@ const userSchema = new mongoose.Schema({
   status: { type: String, default: 'active', enum: ['active', 'suspended', 'pending'] },
   isAdmin: { type: Boolean, default: false },
   walletAddress: { type: String, default: '' },
+  referralCode: { type: String, unique: true, sparse: true },
+  referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  referralEarnings: { type: Number, default: 0 },
+  totalReferrals: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model('User', userSchema);
+
+const referralSchema = new mongoose.Schema({
+  referrer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  referred: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  commission: { type: Number, default: 0 },
+  totalEarned: { type: Number, default: 0 },
+  status: { type: String, default: 'active', enum: ['active', 'inactive'] },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Referral = mongoose.model('Referral', referralSchema);
 
 // Investment Schema
 const investmentSchema = new mongoose.Schema({
@@ -75,6 +90,24 @@ const transactionSchema = new mongoose.Schema({
 });
 
 const Transaction = mongoose.model('Transaction', transactionSchema);
+
+// HELPER FUNCTION to generate unique referral code (after schemas)
+const generateReferralCode = async () => {
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  
+  for (let i = 0; i < 8; i++) {
+    code += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  
+  // Check if code already exists
+  const existing = await User.findOne({ referralCode: code });
+  if (existing) {
+    return generateReferralCode(); // Recursively try again
+  }
+  
+  return code;
+};
 
 // NowPayments API Configuration
 const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
@@ -147,7 +180,7 @@ const adminMiddleware = (req, res, next) => {
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, referralCode } = req.body; // Added referralCode
     
     const existingUser = await User.findOne({ email });
     if (existingUser) {
@@ -156,13 +189,39 @@ app.post('/api/auth/register', async (req, res) => {
     
     const hashedPassword = await bcrypt.hash(password, 10);
     
+    // Generate unique referral code for new user
+    const newUserReferralCode = await generateReferralCode();
+    
     const user = new User({
       name,
       email,
-      password: hashedPassword
+      password: hashedPassword,
+      referralCode: newUserReferralCode
     });
     
-    await user.save();
+    // Handle referral if code provided
+    if (referralCode) {
+      const referrer = await User.findOne({ referralCode: referralCode.toUpperCase() });
+      if (referrer) {
+        user.referredBy = referrer._id;
+        await user.save();
+        
+        // Create referral relationship
+        const referralRelation = new Referral({
+          referrer: referrer._id,
+          referred: user._id
+        });
+        await referralRelation.save();
+        
+        // Update referrer's total referrals
+        referrer.totalReferrals += 1;
+        await referrer.save();
+        
+        console.log(`✅ User ${user.email} referred by ${referrer.email}`);
+      }
+    } else {
+      await user.save();
+    }
     
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     
@@ -174,7 +233,8 @@ app.post('/api/auth/register', async (req, res) => {
         name: user.name,
         email: user.email,
         balance: user.balance,
-        isAdmin: user.isAdmin
+        isAdmin: user.isAdmin,
+        referralCode: user.referralCode
       }
     });
   } catch (error) {
@@ -230,24 +290,80 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
       totalWithdrawn: req.user.totalWithdrawn,
       isAdmin: req.user.isAdmin,
       walletAddress: req.user.walletAddress,
-      status: req.user.status
+      status: req.user.status,
+      referralCode: req.user.referralCode,
+      referralEarnings: req.user.referralEarnings,
+      totalReferrals: req.user.totalReferrals
     }
   });
 });
 
+//ADD NEW ENDPOINT - Get User Referrals.
+app.get('/api/referrals', authMiddleware, async (req, res) => {
+  try {
+    const referrals = await Referral.find({ referrer: req.user._id })
+      .populate('referred', 'name email createdAt')
+      .sort({ createdAt: -1 });
+    
+    res.json({ referrals });
+  } catch (error) {
+    console.error('Get referrals error:', error);
+    res.status(500).json({ error: 'Failed to fetch referrals' });
+  }
+});
+
+// ADD REFERRAL COMMISSION FUNCTION
+const creditReferralCommission = async (userId, profitAmount) => {
+  try {
+    const user = await User.findById(userId);
+    if (!user || !user.referredBy) return;
+    
+    const referrer = await User.findById(user.referredBy);
+    if (!referrer) return;
+    
+    const commission = profitAmount * 0.10; // 10% commission
+    
+    // Credit referrer
+    referrer.balance += commission;
+    referrer.referralEarnings += commission;
+    await referrer.save();
+    
+    // Update referral record
+    await Referral.findOneAndUpdate(
+      { referrer: referrer._id, referred: user._id },
+      { 
+        $inc: { 
+          totalEarned: commission,
+          commission: commission 
+        }
+      }
+    );
+    
+    // Create transaction record
+    const transaction = new Transaction({
+      userId: referrer._id,
+      type: 'bonus',
+      amount: commission,
+      status: 'completed',
+      description: `Referral commission from ${user.name}`,
+      completedAt: new Date()
+    });
+    await transaction.save();
+    
+    console.log(`✅ Referral commission: $${commission.toFixed(2)} to ${referrer.email} from ${user.email}`);
+  } catch (error) {
+    console.error('❌ Referral commission error:', error);
+  }
+};
+
 // ==================== INVESTMENT ROUTES ====================
-
-// Create investment (deposit) - USDT TRC20 ONLY - FIXED VERSION
-// ==================== COMPLETE PAYMENT IMPLEMENTATION - TESTED ====================
-// Replace the investment creation endpoint in your server.js with this EXACT code
-
 // Create investment - PAYMENT ONLY (NO INVOICE)
 app.post('/api/investments/create', authMiddleware, async (req, res) => {
   try {
     const { plan, amount } = req.body;
     
     const plans = {
-      gold: { min: 0.2, roi: 30 },
+      gold: { min: 50, roi: 30 },
       silver: { min: 100, roi: 50 },
       platinum: { min: 200, roi: 90 }
     };
@@ -262,9 +378,9 @@ app.post('/api/investments/create', authMiddleware, async (req, res) => {
     
     const orderId = `INV-${Date.now()}-${req.user._id}`;
     
-    console.log('='.repeat(80));
-    console.log('🚀 CREATING PAYMENT (NOT INVOICE)');
-    console.log('='.repeat(80));
+    // console.log('='.repeat(80));
+    // console.log('🚀 CREATING PAYMENT (NOT INVOICE)');
+    // console.log('='.repeat(80));
     
     // STEP 1: Create payment with NowPayments
   const paymentRequestBody = {
@@ -351,15 +467,15 @@ app.post('/api/investments/create', authMiddleware, async (req, res) => {
     const currency = (paymentDetails.pay_currency || '').toLowerCase();
     if (!currency.includes('usdt')) {
       console.error('❌ Wrong currency:', paymentDetails.pay_currency);
-      throw new Error(`Wrong currency: ${paymentDetails.pay_currency}. Expected USDT TRC20.`);
+      throw new Error(`Wrong currency: ${paymentDetails.pay_currency}. Expected USDTBSC.`);
     }
     
-    console.log('✅ Payment Details Verified:');
-    console.log('   Payment ID:', paymentDetails.payment_id);
-    console.log('   Pay Address:', paymentDetails.pay_address);
-    console.log('   Pay Amount:', paymentDetails.pay_amount);
-    console.log('   Pay Currency:', paymentDetails.pay_currency);
-    console.log('   Status:', paymentDetails.payment_status);
+    // console.log('✅ Payment Details Verified:');
+    // console.log('   Payment ID:', paymentDetails.payment_id);
+    // console.log('   Pay Address:', paymentDetails.pay_address);
+    // console.log('   Pay Amount:', paymentDetails.pay_amount);
+    // console.log('   Pay Currency:', paymentDetails.pay_currency);
+    // console.log('   Status:', paymentDetails.payment_status);
     
     // STEP 3: Save transaction to database
     const transaction = new Transaction({
@@ -562,7 +678,7 @@ app.post('/api/transactions/check-payment/:transactionId', authMiddleware, async
           // Create investment
           const plans = {
             gold: { roi: 30 },
-            silver: { roi: 0.2 },
+            silver: { roi: 50 },
             platinum: { roi: 90 }
           };
           
@@ -709,7 +825,7 @@ app.post('/api/webhooks/nowpayments', async (req, res) => {
         user.totalDeposited += transaction.amount;
         await user.save();
         
-        const plans = { gold: { roi: 30 }, silver: { roi: 0.2 }, platinum: { roi: 90 } };
+        const plans = { gold: { roi: 30 }, silver: { roi: 50 }, platinum: { roi: 90 } };
         const roi = plans[transaction.plan || 'gold'].roi;
         const dailyReturn = (transaction.amount * (roi / 100)) / 30;
         const maturityDate = new Date();
@@ -929,16 +1045,21 @@ const updateDailyReturns = async () => {
         investment.amount += investment.dailyReturn * daysSinceUpdate;
         investment.lastUpdated = new Date();
         
+        const profitAmount = investment.dailyReturn * daysSinceUpdate;
+        
         const user = await User.findById(investment.userId);
         if (user) {
-          user.balance += investment.dailyReturn * daysSinceUpdate;
+          user.balance += profitAmount;
           await user.save();
+          
+          // ADD THIS: Credit referral commission
+          await creditReferralCommission(user._id, profitAmount);
         }
         
         const transaction = new Transaction({
           userId: investment.userId,
           type: 'profit',
-          amount: investment.dailyReturn * daysSinceUpdate,
+          amount: profitAmount,
           status: 'completed',
           description: `Daily profit from ${investment.plan} investment`,
           completedAt: new Date()
